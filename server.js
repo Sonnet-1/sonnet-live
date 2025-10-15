@@ -30,6 +30,10 @@ const ECHO_TEST = false;
 const b64ToU8 = (b64) => Uint8Array.from(Buffer.from(b64, "base64"));
 const i16ToB64 = (i16) => Buffer.from(new Int16Array(i16).buffer).toString("base64");
 
+function safeSend(ws, obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
 // µ-law decode → PCM16
 function muLawDecode(u8) {
   const out = new Int16Array(u8.length);
@@ -108,31 +112,57 @@ wss.on("connection", (twilioWS) => {
       openaiWS.send(JSON.stringify(sessionUpdate));
     });
 
-    openaiWS.on("message", (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      const t = msg?.type;
+   openaiWS.on("message", (data) => {
+  // Try JSON first; if it parses, inspect the type/fields
+  try {
+    const msg = JSON.parse(data.toString());
+    const t = msg?.type;
 
-      if (t === "response.audio.delta" && msg.delta) {
-        // AI speaking chunk: base64 PCM16 @ 24k -> 8k µ-law -> send to Twilio
-        const pcm24k = new Int16Array(Buffer.from(msg.delta, "base64").buffer);
-        const pcm8k = resampleLinear(pcm24k, 24000, 8000);
-        const ulaw = muLawEncode(pcm8k);
-        if (streamSid) {
-          twilioWS.send(JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: Buffer.from(ulaw).toString("base64") }
-          }));
-          twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ai_chunk" } }));
-        }
-        aiSpeaking = true;
-      } else if (t === "response.completed") {
-        aiSpeaking = false;
-        requestedThisTurn = false;
-        if (streamSid) twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ai_done" } }));
+    // Debug: see what OpenAI is actually sending
+    if (t && !String(t).includes("input_audio_buffer")) {
+      console.log("🔈 OpenAI event:", t, Object.keys(msg || {}));
+    }
+
+    // Case A: older shape
+    if (t === "response.audio.delta" && msg.delta) {
+      const pcm24k = new Int16Array(Buffer.from(msg.delta, "base64").buffer);
+      const pcm8k  = resampleLinear(pcm24k, 24000, 8000);
+      const ulaw   = muLawEncode(pcm8k);
+      if (streamSid) {
+        safeSend(twilioWS, { event: "media", streamSid, media: { payload: Buffer.from(ulaw).toString("base64") } });
+        safeSend(twilioWS, { event: "mark",  streamSid, mark: { name: "ai_chunk" } });
       }
-    });
+      aiSpeaking = true;
+      return;
+    }
+
+    // Case B: newer shape (most common now)
+    if (t === "response.output_audio.delta" && msg.audio) {
+      const pcm24k = new Int16Array(Buffer.from(msg.audio, "base64").buffer);
+      const pcm8k  = resampleLinear(pcm24k, 24000, 8000);
+      const ulaw   = muLawEncode(pcm8k);
+      if (streamSid) {
+        safeSend(twilioWS, { event: "media", streamSid, media: { payload: Buffer.from(ulaw).toString("base64") } });
+        safeSend(twilioWS, { event: "mark",  streamSid, mark: { name: "ai_chunk" } });
+      }
+      aiSpeaking = true;
+      return;
+    }
+
+    if (t === "response.completed") {
+      aiSpeaking = false;
+      requestedThisTurn = false;
+      if (streamSid) safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ai_done" } });
+      return;
+    }
+
+    // Nothing we care about
+    return;
+  } catch {
+    // Non-JSON frames: ignore
+    return;
+  }
+});
 
     openaiWS.on("close", () => console.log("🔴 OpenAI Realtime closed"));
     openaiWS.on("error", (e) => console.log("⚠️ OpenAI error", e?.message || e));
@@ -178,7 +208,14 @@ wss.on("connection", (twilioWS) => {
         if (openaiWS.readyState !== 1) return;
         openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" })); // ✅ required
         if (!aiSpeaking && !requestedThisTurn) {
-          openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
+         openaiWS.send(JSON.stringify({
+  type: "response.create",
+  response: {
+    modalities: ["audio"],
+    audio: { format: "pcm_s16le_24000" },   // match our decoder path
+  }
+}));
+
           requestedThisTurn = true;
         }
       }, 200); // wait 200ms of silence before committing
