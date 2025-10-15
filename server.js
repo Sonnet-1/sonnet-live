@@ -20,13 +20,13 @@ app.post("/voice", (req, res) => {
   );
 });
 
+/* ---------- Feature flags ---------- */
+const USE_ELEVENLABS = true; // << turn EL streaming voice on/off
+
 /* ---------- Helpers ---------- */
 const b64ToBuf = (b64) => Buffer.from(b64, "base64");
-
-// Create Int16Array view with correct byteOffset/length
 const bufToI16 = (buf) => new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
 
-// linear resample between 8k / 16k / 24k (Int16 in/out)
 function resampleLinear(pcm, inRate, outRate) {
   if (inRate === outRate) return pcm;
   const ratio = outRate / inRate;
@@ -41,30 +41,21 @@ function resampleLinear(pcm, inRate, outRate) {
   return out;
 }
 
-/* ----- G.711 μ-law encode/decode (standard, clean) ----- */
+/* ----- G.711 μ-law encode/decode ----- */
 function muLawEncode(pcm) {
-  const MU = 255;
   const out = new Uint8Array(pcm.length);
   for (let i = 0; i < pcm.length; i++) {
     let s = Math.max(-32768, Math.min(32767, pcm[i]));
     const sign = s < 0 ? 0x80 : 0x00;
-    s = Math.abs(s);
-
-    // Convert from 16-bit linear PCM to μ-law.
-    s = s + 132; // bias
+    s = Math.abs(s) + 132;
     if (s > 32767) s = 32767;
-
-    // Find exponent and mantissa
     let exponent = 7;
     for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
     const mantissa = (s >> ((exponent === 0 ? 1 : exponent) + 3)) & 0x0f;
-
-    const ulawByte = ~(sign | (exponent << 4) | mantissa) & 0xff;
-    out[i] = ulawByte;
+    out[i] = ~(sign | (exponent << 4) | mantissa) & 0xff;
   }
   return out;
 }
-
 function muLawDecode(ulaw) {
   const out = new Int16Array(ulaw.length);
   for (let i = 0; i < ulaw.length; i++) {
@@ -78,10 +69,10 @@ function muLawDecode(ulaw) {
   return out;
 }
 
-/* ----- Twilio send helper: chunk into 20ms frames (160 bytes @ 8kHz) ----- */
+/* ----- Twilio media sender: 20ms μ-law chunks (160 bytes @ 8kHz) ----- */
 function sendUlawToTwilio(twilioWS, streamSid, ulaw) {
   if (!streamSid || !twilioWS || twilioWS.readyState !== 1) return;
-  const FRAME_BYTES = 160; // 20ms of 8kHz μ-law audio
+  const FRAME_BYTES = 160;
   for (let off = 0; off < ulaw.length; off += FRAME_BYTES) {
     const slice = ulaw.subarray(off, Math.min(off + FRAME_BYTES, ulaw.length));
     const payloadB64 = Buffer.from(slice).toString("base64");
@@ -102,6 +93,79 @@ function connectOpenAI() {
   return new WebSocket(url, { headers });
 }
 
+/* ---------- ElevenLabs TTS (streaming) ---------- */
+/* We request μ-law 8k if supported; if PCM comes back, we resample+encode. */
+async function speakWithElevenLabs({ text, twilioWS, streamSid }) {
+  const apiKey = process.env.sk_359a89e9f4491c06c7880b18c71a82f63fce132083811694;
+  const voiceId = process.env.BlUZNLlNS79wwp12qYPm;
+  if (!apiKey || !voiceId || !text) return;
+
+  // Try to request μ-law 8k directly for zero-conversion playback
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+  const body = {
+    text,
+    // Lower numbers = more streaming/smaller chunks; tune as desired
+    optimize_streaming_latency: 3,
+    // Some accounts support 'ulaw_8000'; if not, service may return another format
+    output_format: "ulaw_8000"
+  };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "xi-api-key": apiKey,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!r.ok || !r.body) {
+    console.log("⚠️ ElevenLabs stream failed:", r.status, await r.text().catch(() => ""));
+    return;
+  }
+
+  const ctype = (r.headers.get("content-type") || "").toLowerCase();
+  // Stream chunks as they arrive
+  const reader = r.body.getReader();
+  let leftover = Buffer.alloc(0);
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value || value.length === 0) continue;
+
+    // If we got μ-law bytes already, just forward in 160-byte frames.
+    if (ctype.includes("ulaw") || ctype.includes("mulaw") || ctype.includes("x-mulaw")) {
+      const bytes = new Uint8Array(value);
+      sendUlawToTwilio(twilioWS, streamSid, bytes);
+      continue;
+    }
+
+    // Otherwise, assume raw PCM (often 16k). Join with any leftover partial frame.
+    // We’ll treat it as Int16, resample -> μ-law, then send.
+    const buf = Buffer.concat([leftover, Buffer.from(value)]);
+    const evenBytes = buf.length - (buf.length % 2);
+    const frame = buf.subarray(0, evenBytes);
+    leftover = buf.subarray(evenBytes);
+
+    if (frame.length >= 2) {
+      const i16 = bufToI16(frame);
+      // guess common case: 16k PCM from TTS
+      const pcm8 = resampleLinear(i16, 16000, 8000);
+      const ulaw = muLawEncode(pcm8);
+      sendUlawToTwilio(twilioWS, streamSid, ulaw);
+    }
+  }
+
+  // Flush any small leftover (optional)
+  if (leftover.length >= 2) {
+    const i16 = bufToI16(leftover);
+    const pcm8 = resampleLinear(i16, 16000, 8000);
+    const ulaw = muLawEncode(pcm8);
+    sendUlawToTwilio(twilioWS, streamSid, ulaw);
+  }
+}
+
 /* ---------- Bridge server ---------- */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-stream" });
@@ -115,6 +179,9 @@ wss.on("connection", (twilioWS) => {
   let requestedThisTurn = false;
   let debounceTimer = null;
 
+  // Buffer for assistant transcript (we’ll speak this with ElevenLabs)
+  let assistantTextBuffer = "";
+
   const openaiWS = connectOpenAI();
   openaiWS.binaryType = "arraybuffer";
 
@@ -127,55 +194,76 @@ wss.on("connection", (twilioWS) => {
         type: "realtime",
         model: "gpt-4o-realtime-preview",
         instructions:
-          "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
+          "You are a receptionist for a hospitality company in the greater orlando area that serves Disney guests with luxury rv rentals. Keep answers under two sentences and pause when the caller speaks."
       }
     };
     openaiWS.send(JSON.stringify(sessionUpdate));
 
-    // Brief greeting so we can hear output audio
+    // Brief greeting to kick things off (we’ll still speak via EL)
     openaiWS.send(JSON.stringify({
       type: "response.create",
-      response: { instructions: "Hello, thanks for calling. How can I help today?" }
+      response: { instructions: "Hello, This is Max at Kissimmee Orlando RV. How can I help today?" }
     }));
   });
 
-  /* ----- OpenAI -> Twilio (downlink audio) ----- */
-  openaiWS.on("message", (data) => {
+  /* ----- OpenAI -> (ElevenLabs or Twilio) ----- */
+  openaiWS.on("message", async (data) => {
     try {
       const msg = JSON.parse(data.toString());
       const t = msg?.type;
 
       if (t && !String(t).includes("input_audio_buffer")) {
-        // Debug logging to see the event mix
         console.log("🔈 OpenAI event:", t, Object.keys(msg || {}));
       }
 
-      // Handle audio deltas (two possible field names)
-      if ((t === "response.output_audio.delta" && msg.delta) ||
-          (t === "response.audio.delta" && msg.delta)) {
-        const audioBuf = b64ToBuf(msg.delta);                // base64 -> Buffer
-        const pcm24 = bufToI16(audioBuf);                    // Buffer -> Int16Array view
-        const pcm8 = resampleLinear(pcm24, 24000, 8000);     // 24k -> 8k
-        const ulaw = muLawEncode(pcm8);                      // PCM -> μ-law
-        sendUlawToTwilio(twilioWS, streamSid, ulaw);         // chunked send
-        aiSpeaking = true;
+      // Accumulate assistant text transcript as it streams
+      if (t === "response.output_audio_transcript.delta" && msg.delta) {
+        assistantTextBuffer += msg.delta;
         return;
       }
 
+      // If you're *not* using ElevenLabs, you could forward OpenAI audio directly:
+      if (!USE_ELEVENLABS) {
+        if ((t === "response.output_audio.delta" && msg.delta) ||
+            (t === "response.audio.delta" && msg.delta)) {
+          const audioBuf = b64ToBuf(msg.delta);
+          const pcm24 = bufToI16(audioBuf);
+          const pcm8 = resampleLinear(pcm24, 24000, 8000);
+          const ulaw = muLawEncode(pcm8);
+          sendUlawToTwilio(twilioWS, streamSid, ulaw);
+          aiSpeaking = true;
+          return;
+        }
+      }
+
       if (t === "response.completed") {
+        // Speak the collected assistant text with ElevenLabs
+        if (USE_ELEVENLABS && assistantTextBuffer.trim()) {
+          aiSpeaking = true;
+          try {
+            await speakWithElevenLabs({
+              text: assistantTextBuffer.trim(),
+              twilioWS,
+              streamSid
+            });
+          } catch (e) {
+            console.log("⚠️ ElevenLabs playback error:", e?.message || e);
+          }
+        }
+        assistantTextBuffer = "";
         aiSpeaking = false;
         requestedThisTurn = false;
         return;
       }
     } catch {
-      // non-JSON frames ignored
+      // ignore non-JSON frames
     }
   });
 
   openaiWS.on("close", () => console.log("🔴 OpenAI Realtime closed"));
   openaiWS.on("error", (e) => console.log("⚠️ OpenAI error", e?.message || e));
 
-  /* ----- Twilio -> OpenAI (uplink audio) ----- */
+  /* ----- Twilio -> OpenAI ----- */
   twilioWS.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -184,7 +272,7 @@ wss.on("connection", (twilioWS) => {
       streamSid = msg.start?.streamSid || msg.streamSid || null;
       console.log("▶️ stream start", streamSid, msg.start?.callSid);
 
-      // keepalive ping (optional)
+      // keepalive mark
       const ping = setInterval(() => {
         if (twilioWS.readyState === 1 && streamSid) {
           twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ping" } }));
@@ -199,7 +287,7 @@ wss.on("connection", (twilioWS) => {
       // Twilio -> μ-law/8k base64
       const ulaw = new Uint8Array(b64ToBuf(msg.media.payload));
       const pcm8 = muLawDecode(ulaw);
-      const pcm16 = resampleLinear(pcm8, 8000, 16000);               // 8k -> 16k for input
+      const pcm16 = resampleLinear(pcm8, 8000, 16000); // 8k -> 16k input
       const b64 = Buffer.from(new Int16Array(pcm16).buffer).toString("base64");
 
       if (openaiWS?.readyState === 1) {
@@ -213,7 +301,7 @@ wss.on("connection", (twilioWS) => {
             openaiWS.send(JSON.stringify({ type: "response.create", response: {} }));
             requestedThisTurn = true;
           }
-        }, 200); // commit after brief pause
+        }, 200);
       }
       return;
     }
