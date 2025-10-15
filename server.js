@@ -95,28 +95,26 @@ wss.on("connection", (twilioWS) => {
   if (openaiWS) openaiWS.binaryType = "arraybuffer";
 
   if (openaiWS) {
-    openaiWS.on("open", () => {
+   openaiWS.on("open", () => {
   console.log("🟢 OpenAI Realtime connected");
- // Correct, minimal session payload
+
+  // Minimal, valid session payload
   const sessionUpdate = {
     type: "session.update",
     session: {
       type: "realtime",
       model: "gpt-4o-realtime-preview",
-      voice: "alloy",
-      audio_format: "pcm_s16le_24000",
       instructions:
         "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
     }
   };
   openaiWS.send(JSON.stringify(sessionUpdate));
 
-  // Greeting using the same voice and format
+  // Ask the model to speak; put voice ONLY on the response
   openaiWS.send(JSON.stringify({
     type: "response.create",
     response: {
       instructions: "Hello, thanks for calling. How can I help today?",
-      audio_format: "pcm_s16le_24000",
       voice: "alloy"
     }
   }));
