@@ -11,16 +11,14 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 app.post("/voice", (req, res) => {
-  const wsUrl = process.env.WS_PUBLIC_URL || `wss://${req.headers.host}/twilio-stream`;
   res.type("text/xml").send(
     `<Response>
-       <Connect>
-         <Stream url="${wsUrl}"/>
-       </Connect>
+       <Say voice="alice">Hi from Sonnet. Your webhook is working.</Say>
+       <Pause length="1"/>
+       <Say>Goodbye.</Say>
      </Response>`
   );
 });
-
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-stream" });
 
