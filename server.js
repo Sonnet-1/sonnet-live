@@ -111,6 +111,15 @@ wss.on("connection", (twilioWS) => {
       };
       openaiWS.send(JSON.stringify(sessionUpdate));
     });
+// Force a quick greeting so we can confirm audio-out is working
+openaiWS.send(JSON.stringify({
+  type: "response.create",
+  response: {
+    modalities: ["audio"],
+    audio: { format: "pcm_s16le_24000" },
+    instructions: "Greet the caller briefly and say you are ready to help."
+  }
+}));
 
    openaiWS.on("message", (data) => {
   // Try JSON first; if it parses, inspect the type/fields
@@ -122,6 +131,10 @@ wss.on("connection", (twilioWS) => {
     if (t && !String(t).includes("input_audio_buffer")) {
       console.log("🔈 OpenAI event:", t, Object.keys(msg || {}));
     }
+    if (t === "error" && msg.error) {
+      console.log("❌ OpenAI error detail:", JSON.stringify(msg.error));
+    }
+
 
     // Case A: older shape
     if (t === "response.audio.delta" && msg.delta) {
