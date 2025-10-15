@@ -11,16 +11,40 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 app.post("/voice", (req, res) => {
+  const wsUrl = process.env.WS_PUBLIC_URL || `wss://${req.headers.host}/twilio-stream`;
   res.type("text/xml").send(
     `<Response>
-       <Say voice="alice">Hi from Sonnet. Your webhook is working.</Say>
-       <Pause length="1"/>
-       <Say>Goodbye.</Say>
+       <Say voice="alice">Connecting you now.</Say>
+       <Connect>
+         <Stream url="${wsUrl}" />
+       </Connect>
      </Response>`
   );
 });
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-stream" });
+wss.on("connection", (twilioWS) => {
+  console.log("🔌 Twilio stream connected");
+
+  twilioWS.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      // You’ll see events: "start", "media", "mark", "dtmf", "stop"
+      if (msg.event === "start") {
+        console.log("▶️ stream start", msg.streamSid, msg.start?.callSid, msg.start?.from);
+      } else if (msg.event === "media") {
+        // media.payload is base64 audio frames
+      } else if (msg.event === "stop") {
+        console.log("⏹️ stream stop");
+      }
+    } catch {
+      // ignore
+    }
+  });
+
+  twilioWS.on("close", () => console.log("🔌 Twilio stream closed"));
+  twilioWS.on("error", () => console.log("⚠️ Twilio stream error"));
+});
 
 function connectOpenAI() {
   const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
