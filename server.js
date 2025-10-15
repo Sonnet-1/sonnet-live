@@ -21,9 +21,54 @@ app.post("/voice", (req, res) => {
      </Response>`
   );
 });
+function connectOpenAI() {
+  const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+  const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` };
+  return new WebSocket(url, { headers });
+}
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-stream" });
 wss.on("connection", (twilioWS) => {
+  console.log("🔌 Twilio stream connected");
+
+  const openaiWS = connectOpenAI();
+
+  openaiWS.on("open", () => {
+    console.log("🟢 OpenAI Realtime connected");
+    const sessionUpdate = {
+      type: "session.update",
+      session: {
+        instructions:
+          "You are a warm, concise receptionist. Keep replies under two sentences and stop talking when the caller speaks."
+      }
+    };
+    openaiWS.send(JSON.stringify(sessionUpdate));
+  });
+
+  openaiWS.on("close", () => console.log("🔴 OpenAI Realtime closed"));
+  openaiWS.on("error", (e) => console.log("⚠️ OpenAI error", e?.message || e));
+
+  twilioWS.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.event === "start") {
+        console.log("▶️ stream start", msg.streamSid, msg.start?.callSid, msg.start?.from);
+      } else if (msg.event === "stop") {
+        console.log("⏹️ stream stop");
+      }
+    } catch {}
+  });
+
+  twilioWS.on("close", () => {
+    console.log("🔌 Twilio stream closed");
+    try { openaiWS.close(); } catch {}
+  });
+  twilioWS.on("error", () => {
+    console.log("⚠️ Twilio stream error");
+    try { openaiWS.close(); } catch {}
+  });
+});
   console.log("🔌 Twilio stream connected");
 
   twilioWS.on("message", (raw) => {
