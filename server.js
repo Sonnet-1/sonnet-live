@@ -23,7 +23,8 @@ app.post("/voice", (req, res) => {
 /* -------------------------- Config switches -------------------------- */
 // Set ECHO_TEST=true to loop caller audio straight back to Twilio.
 // Once you confirm you can hear your own voice, set it to false for AI.
-const ECHO_TEST = true;
+const ECHO_TEST = false;
+
 
 /* -------------------------- Tiny audio helpers -------------------------- */
 const b64ToU8 = (b64) => Uint8Array.from(Buffer.from(b64, "base64"));
