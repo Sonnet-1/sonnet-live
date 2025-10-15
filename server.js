@@ -98,30 +98,33 @@ wss.on("connection", (twilioWS) => {
   if (openaiWS) openaiWS.binaryType = "arraybuffer";
 
   if (openaiWS) {
-    openaiWS.on("open", () => {
-      console.log("🟢 OpenAI Realtime connected");
-      const sessionUpdate = {
-  type: "session.update",
-  session: {
-    type: "realtime.session",
-    model: "gpt-4o-realtime-preview",
-    voice: "alloy",
-    input_audio_format: "pcm_s16le_16000",
-    output_audio_format: "pcm_s16le_24000",
-    instructions:
-      "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
-  }
-};
+   openaiWS.on("open", () => {
+  console.log("🟢 OpenAI Realtime connected");
 
-     openaiWS.send(JSON.stringify({
-  type: "response.create",
-  response: {
-    instructions: "Hello, thanks for calling. How can I help today?",
-    modalities: ["audio"],
-    audio_format: "pcm_s16le_24000"
-}));
+  // Required session shape
+  const sessionUpdate = {
+    type: "session.update",
+    session: {
+      type: "realtime.session",
+      model: "gpt-4o-realtime-preview",
+      voice: "alloy",
+      input_audio_format: "pcm_s16le_16000",
+      output_audio_format: "pcm_s16le_24000",
+      instructions:
+        "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
+    }
+  };
+  openaiWS.send(JSON.stringify(sessionUpdate));
 
-    });
+  // Simple greeting so we can confirm audio out works
+  openaiWS.send(JSON.stringify({
+    type: "response.create",
+    response: {
+      instructions: "Hello, thanks for calling. How can I help today?",
+      audio_format: "pcm_s16le_24000"
+    }
+  }));
+});
 
     openaiWS.on("message", (data) => {
       // Try JSON
