@@ -217,10 +217,16 @@ wss.on("connection", (twilioWS) => {
       }
 
       // Accumulate assistant text transcript as it streams
-      if (t === "response.output_audio_transcript.delta" && msg.delta) {
-        assistantTextBuffer += msg.delta;
-        return;
-      }
+     // Capture only assistant-spoken English output
+if (t === "response.output_audio_transcript.delta" && msg.delta) {
+  // Skip fragments containing system or reasoning traces
+  const text = msg.delta.trim();
+  if (text && /^[a-zA-Z0-9 ,.'?!]/.test(text)) {
+    assistantTextBuffer += " " + text;
+  }
+  return;
+}
+
 
       // If you're *not* using ElevenLabs, you could forward OpenAI audio directly:
       if (!USE_ELEVENLABS) {
