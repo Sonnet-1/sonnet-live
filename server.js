@@ -78,6 +78,19 @@ function connectOpenAI() {
 /* ------------------------ WebSocket bridge ------------------------ */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-stream" });
+let streamSid = null;
+twilioWS.on("message", (raw) => {
+  try {
+    const msg = JSON.parse(raw.toString());
+
+    if (msg.event === "start") {
+      // Twilio sends the stream SID here
+      streamSid = msg.start?.streamSid || msg.streamSid || null;
+      console.log("▶️ stream start", streamSid, msg.start?.callSid);
+      return;
+    }
+
+    // ... keep your existing handling for "media"/"stop" here ...
 
 wss.on("connection", (twilioWS) => {
   console.log("🔌 Twilio stream connected");
@@ -118,7 +131,20 @@ wss.on("connection", (twilioWS) => {
         const ulaw = muLawEncode(pcm8k);
         const payloadB64 = Buffer.from(ulaw).toString("base64");
         // send to Twilio as media
-        twilioWS.send(JSON.stringify({ event: "media", media: { payload: payloadB64 } }));
+        if (streamSid) {
+  twilioWS.send(JSON.stringify({
+    event: "media",
+    streamSid,                            // ✅ REQUIRED
+    media: { payload: payloadB64 }        // base64 mulaw/8000, no headers
+  }));
+  // (optional) ask Twilio to notify when that chunk is fully played
+  twilioWS.send(JSON.stringify({
+    event: "mark",
+    streamSid,
+    mark: { name: "ai_chunk" }
+  }));
+}
+
         aiSpeaking = true;
       } else if (t === "response.completed") {
         // mark end of AI turn
