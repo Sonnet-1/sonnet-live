@@ -21,19 +21,16 @@ app.post("/voice", (req, res) => {
 });
 
 /* -------------------------- CONFIG -------------------------- */
-// TEMP: echo your voice for a quick test. Set to false to enable AI.
-const ECHO_TEST = false;
+const ECHO_TEST = false; // set to true for audio echo only (no AI)
 
 /* -------------------------- HELPERS -------------------------- */
 const b64ToU8 = (b64) => Uint8Array.from(Buffer.from(b64, "base64"));
 const i16ToB64 = (i16) => Buffer.from(new Int16Array(i16).buffer).toString("base64");
 
-// safe send to Twilio WS
 function safeSend(ws, obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
-// μ-law decode → PCM16
 function muLawDecode(u8) {
   const out = new Int16Array(u8.length);
   for (let i = 0; i < u8.length; i++) {
@@ -45,13 +42,13 @@ function muLawDecode(u8) {
   }
   return out;
 }
-// PCM16 → μ-law
+
 function muLawEncode(pcm) {
   const out = new Uint8Array(pcm.length);
   for (let i = 0; i < pcm.length; i++) {
     let s = Math.max(-32768, Math.min(32767, pcm[i]));
     const sign = s < 0 ? 0x80 : 0x00;
-    s = Math.abs(s) + 132; // bias
+    s = Math.abs(s) + 132;
     let log = 0;
     for (let tmp = s >> 3; tmp; tmp >>= 1) log++;
     const mant = (s >> (log + 3)) & 0x0f;
@@ -59,7 +56,7 @@ function muLawEncode(pcm) {
   }
   return out;
 }
-// linear resample 8k/16k/24k
+
 function resampleLinear(pcm, inRate, outRate) {
   if (inRate === outRate) return pcm;
   const ratio = outRate / inRate;
@@ -98,35 +95,35 @@ wss.on("connection", (twilioWS) => {
   if (openaiWS) openaiWS.binaryType = "arraybuffer";
 
   if (openaiWS) {
-   openaiWS.on("open", () => {
-  console.log("🟢 OpenAI Realtime connected");
+    openaiWS.on("open", () => {
+      console.log("🟢 OpenAI Realtime connected");
 
-  // Correct session payload
-  const sessionUpdate = {
-    type: "session.update",
-    session: {
-      type: "realtime",                    // <-- fixed
-      model: "gpt-4o-realtime-preview",
-      voice: "alloy",
-      input_audio_format: "pcm_s16le_16000",
-      output_audio_format: "pcm_s16le_24000",
-      instructions:
-        "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
-    }
-  };
-  openaiWS.send(JSON.stringify(sessionUpdate));
+      // Correct session payload (no voice)
+      const sessionUpdate = {
+        type: "session.update",
+        session: {
+          type: "realtime",
+          model: "gpt-4o-realtime-preview",
+          input_audio_format: "pcm_s16le_16000",
+          output_audio_format: "pcm_s16le_24000",
+          instructions:
+            "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
+        }
+      };
+      openaiWS.send(JSON.stringify(sessionUpdate));
 
-  // Simple greeting — rely on session audio settings (no extra fields)
-  openaiWS.send(JSON.stringify({
-    type: "response.create",
-    response: {
-      instructions: "Hello, thanks for calling. How can I help today?"
-    }
-  }));
-});
+      // Greeting — specify voice here
+      openaiWS.send(JSON.stringify({
+        type: "response.create",
+        response: {
+          instructions: "Hello, thanks for calling. How can I help today?",
+          modalities: ["audio"],
+          speech: { voice: "alloy" }
+        }
+      }));
+    });
 
     openaiWS.on("message", (data) => {
-      // Try JSON
       try {
         const msg = JSON.parse(data.toString());
         const t = msg?.type;
@@ -138,27 +135,13 @@ wss.on("connection", (twilioWS) => {
           }
         }
 
-        // Old shape
-        if (t === "response.audio.delta" && msg.delta) {
-          const pcm24k = new Int16Array(Buffer.from(msg.delta, "base64").buffer);
-          const pcm8k = resampleLinear(pcm24k, 24000, 8000);
-          const ulaw = muLawEncode(pcm8k);
-          if (streamSid) {
-            safeSend(twilioWS, { event: "media", streamSid, media: { payload: Buffer.from(ulaw).toString("base64") } });
-            safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ai_chunk" } });
-          }
-          aiSpeaking = true;
-          return;
-        }
-
-        // Newer shape
+        // Handle both possible audio output formats
         if (t === "response.output_audio.delta" && msg.audio) {
           const pcm24k = new Int16Array(Buffer.from(msg.audio, "base64").buffer);
           const pcm8k = resampleLinear(pcm24k, 24000, 8000);
           const ulaw = muLawEncode(pcm8k);
           if (streamSid) {
             safeSend(twilioWS, { event: "media", streamSid, media: { payload: Buffer.from(ulaw).toString("base64") } });
-            safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ai_chunk" } });
           }
           aiSpeaking = true;
           return;
@@ -167,12 +150,11 @@ wss.on("connection", (twilioWS) => {
         if (t === "response.completed") {
           aiSpeaking = false;
           requestedThisTurn = false;
-          if (streamSid) safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ai_done" } });
           return;
         }
 
       } catch {
-        // Non-JSON, ignore
+        // ignore non-JSON frames
       }
     });
 
@@ -189,7 +171,6 @@ wss.on("connection", (twilioWS) => {
       streamSid = msg.start?.streamSid || msg.streamSid || null;
       console.log("▶️ stream start", streamSid, msg.start?.callSid);
 
-      // heartbeat after streamSid exists
       const ping = setInterval(() => {
         if (twilioWS.readyState === 1 && streamSid) {
           safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ping" } });
@@ -224,7 +205,10 @@ wss.on("connection", (twilioWS) => {
         if (!aiSpeaking && !requestedThisTurn) {
           openaiWS.send(JSON.stringify({
             type: "response.create",
-            response: { modalities: ["audio"], audio: { format: "pcm_s16le_24000" } }
+            response: {
+              modalities: ["audio"],
+              speech: { voice: "alloy" }
+            }
           }));
           requestedThisTurn = true;
         }
