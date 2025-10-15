@@ -9,7 +9,7 @@ app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-/* ---------- Twilio endpoint ---------- */
+/* ---------- Twilio webhook ---------- */
 app.post("/voice", (req, res) => {
   const wsUrl = process.env.WS_PUBLIC_URL || `wss://${req.headers.host}/twilio-stream`;
   res.type("text/xml").send(
@@ -20,36 +20,13 @@ app.post("/voice", (req, res) => {
   );
 });
 
-/* ---------- Audio helpers ---------- */
-const b64ToU8 = (b64) => Uint8Array.from(Buffer.from(b64, "base64"));
-const i16ToB64 = (i16) => Buffer.from(new Int16Array(i16).buffer).toString("base64");
+/* ---------- Helpers ---------- */
+const b64ToBuf = (b64) => Buffer.from(b64, "base64");
 
-function muLawDecode(u8) {
-  const out = new Int16Array(u8.length);
-  for (let i = 0; i < u8.length; i++) {
-    let u = 255 - u8[i];
-    const sign = u & 0x80 ? -1 : 1;
-    u &= 0x7f;
-    let t = ((u << 2) + 33) << 2;
-    out[i] = sign * (t < 32768 ? t : 32767);
-  }
-  return out;
-}
+// Create Int16Array view with correct byteOffset/length
+const bufToI16 = (buf) => new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
 
-function muLawEncode(pcm) {
-  const out = new Uint8Array(pcm.length);
-  for (let i = 0; i < pcm.length; i++) {
-    let s = Math.max(-32768, Math.min(32767, pcm[i]));
-    const sign = s < 0 ? 0x80 : 0x00;
-    s = Math.abs(s) + 132;
-    let log = 0;
-    for (let tmp = s >> 3; tmp; tmp >>= 1) log++;
-    const mant = (s >> (log + 3)) & 0x0f;
-    out[i] = ~(sign | (log << 4) | mant) & 0xff;
-  }
-  return out;
-}
-
+// linear resample between 8k / 16k / 24k (Int16 in/out)
 function resampleLinear(pcm, inRate, outRate) {
   if (inRate === outRate) return pcm;
   const ratio = outRate / inRate;
@@ -64,8 +41,58 @@ function resampleLinear(pcm, inRate, outRate) {
   return out;
 }
 
-function safeSend(ws, obj) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+/* ----- G.711 μ-law encode/decode (standard, clean) ----- */
+function muLawEncode(pcm) {
+  const MU = 255;
+  const out = new Uint8Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) {
+    let s = Math.max(-32768, Math.min(32767, pcm[i]));
+    const sign = s < 0 ? 0x80 : 0x00;
+    s = Math.abs(s);
+
+    // Convert from 16-bit linear PCM to μ-law.
+    s = s + 132; // bias
+    if (s > 32767) s = 32767;
+
+    // Find exponent and mantissa
+    let exponent = 7;
+    for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+    const mantissa = (s >> ((exponent === 0 ? 1 : exponent) + 3)) & 0x0f;
+
+    const ulawByte = ~(sign | (exponent << 4) | mantissa) & 0xff;
+    out[i] = ulawByte;
+  }
+  return out;
+}
+
+function muLawDecode(ulaw) {
+  const out = new Int16Array(ulaw.length);
+  for (let i = 0; i < ulaw.length; i++) {
+    let u = ~ulaw[i];
+    const sign = u & 0x80;
+    let exponent = (u >> 4) & 0x07;
+    let mantissa = u & 0x0f;
+    let sample = ((mantissa << 3) + 0x84) << (exponent === 0 ? 0 : exponent - 1);
+    out[i] = sign ? -sample : sample;
+  }
+  return out;
+}
+
+/* ----- Twilio send helper: chunk into 20ms frames (160 bytes @ 8kHz) ----- */
+function sendUlawToTwilio(twilioWS, streamSid, ulaw) {
+  if (!streamSid || !twilioWS || twilioWS.readyState !== 1) return;
+  const FRAME_BYTES = 160; // 20ms of 8kHz μ-law audio
+  for (let off = 0; off < ulaw.length; off += FRAME_BYTES) {
+    const slice = ulaw.subarray(off, Math.min(off + FRAME_BYTES, ulaw.length));
+    const payloadB64 = Buffer.from(slice).toString("base64");
+    if (twilioWS.readyState === 1) {
+      twilioWS.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: payloadB64 }
+      }));
+    }
+  }
 }
 
 /* ---------- OpenAI Realtime ---------- */
@@ -75,7 +102,7 @@ function connectOpenAI() {
   return new WebSocket(url, { headers });
 }
 
-/* ---------- WebSocket bridge ---------- */
+/* ---------- Bridge server ---------- */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-stream" });
 
@@ -94,7 +121,6 @@ wss.on("connection", (twilioWS) => {
   openaiWS.on("open", () => {
     console.log("🟢 OpenAI Realtime connected");
 
-    // Minimal valid payload
     const sessionUpdate = {
       type: "session.update",
       session: {
@@ -106,38 +132,32 @@ wss.on("connection", (twilioWS) => {
     };
     openaiWS.send(JSON.stringify(sessionUpdate));
 
-    // Greeting - no voice param
+    // Brief greeting so we can hear output audio
     openaiWS.send(JSON.stringify({
       type: "response.create",
-      response: {
-        instructions: "Hello, thanks for calling. How can I help today?"
-      }
+      response: { instructions: "Hello, thanks for calling. How can I help today?" }
     }));
   });
 
+  /* ----- OpenAI -> Twilio (downlink audio) ----- */
   openaiWS.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
       const t = msg?.type;
+
       if (t && !String(t).includes("input_audio_buffer")) {
+        // Debug logging to see the event mix
         console.log("🔈 OpenAI event:", t, Object.keys(msg || {}));
-        if (t === "error" && msg.error)
-          console.log("❌ OpenAI error detail:", JSON.stringify(msg.error));
       }
 
-      // Handle both audio formats
-      if ((t === "response.audio.delta" && msg.delta) ||
-          (t === "response.output_audio.delta" && msg.audio)) {
-        const audioB64 = msg.delta || msg.audio;
-        const pcm24k = new Int16Array(Buffer.from(audioB64, "base64").buffer);
-        const pcm8k = resampleLinear(pcm24k, 24000, 8000);
-        const ulaw = muLawEncode(pcm8k);
-        if (streamSid)
-          safeSend(twilioWS, {
-            event: "media",
-            streamSid,
-            media: { payload: Buffer.from(ulaw).toString("base64") }
-          });
+      // Handle audio deltas (two possible field names)
+      if ((t === "response.output_audio.delta" && msg.delta) ||
+          (t === "response.audio.delta" && msg.delta)) {
+        const audioBuf = b64ToBuf(msg.delta);                // base64 -> Buffer
+        const pcm24 = bufToI16(audioBuf);                    // Buffer -> Int16Array view
+        const pcm8 = resampleLinear(pcm24, 24000, 8000);     // 24k -> 8k
+        const ulaw = muLawEncode(pcm8);                      // PCM -> μ-law
+        sendUlawToTwilio(twilioWS, streamSid, ulaw);         // chunked send
         aiSpeaking = true;
         return;
       }
@@ -145,16 +165,17 @@ wss.on("connection", (twilioWS) => {
       if (t === "response.completed") {
         aiSpeaking = false;
         requestedThisTurn = false;
-        if (streamSid) safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ai_done" } });
         return;
       }
-    } catch {}
+    } catch {
+      // non-JSON frames ignored
+    }
   });
 
   openaiWS.on("close", () => console.log("🔴 OpenAI Realtime closed"));
   openaiWS.on("error", (e) => console.log("⚠️ OpenAI error", e?.message || e));
 
-  // Twilio -> OpenAI
+  /* ----- Twilio -> OpenAI (uplink audio) ----- */
   twilioWS.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -163,10 +184,11 @@ wss.on("connection", (twilioWS) => {
       streamSid = msg.start?.streamSid || msg.streamSid || null;
       console.log("▶️ stream start", streamSid, msg.start?.callSid);
 
-      // Ping keepalive
+      // keepalive ping (optional)
       const ping = setInterval(() => {
-        if (twilioWS.readyState === 1 && streamSid)
-          safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ping" } });
+        if (twilioWS.readyState === 1 && streamSid) {
+          twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ping" } }));
+        }
       }, 5000);
       twilioWS.on("close", () => clearInterval(ping));
       twilioWS.on("error", () => clearInterval(ping));
@@ -174,10 +196,11 @@ wss.on("connection", (twilioWS) => {
     }
 
     if (msg.event === "media") {
-      const ulaw = b64ToU8(msg.media.payload);
-      const pcm8k = muLawDecode(ulaw);
-      const pcm16k = resampleLinear(pcm8k, 8000, 16000);
-      const b64 = i16ToB64(pcm16k);
+      // Twilio -> μ-law/8k base64
+      const ulaw = new Uint8Array(b64ToBuf(msg.media.payload));
+      const pcm8 = muLawDecode(ulaw);
+      const pcm16 = resampleLinear(pcm8, 8000, 16000);               // 8k -> 16k for input
+      const b64 = Buffer.from(new Int16Array(pcm16).buffer).toString("base64");
 
       if (openaiWS?.readyState === 1) {
         openaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
@@ -190,7 +213,7 @@ wss.on("connection", (twilioWS) => {
             openaiWS.send(JSON.stringify({ type: "response.create", response: {} }));
             requestedThisTurn = true;
           }
-        }, 200);
+        }, 200); // commit after brief pause
       }
       return;
     }
