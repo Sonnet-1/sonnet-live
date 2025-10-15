@@ -20,8 +20,12 @@ app.post("/voice", (req, res) => {
   );
 });
 
+/* -------------------------- Config switches -------------------------- */
+// Set ECHO_TEST=true to loop caller audio straight back to Twilio.
+// Once you confirm you can hear your own voice, set it to false for AI.
+const ECHO_TEST = true;
+
 /* -------------------------- Tiny audio helpers -------------------------- */
-// base64 helpers
 const b64ToU8 = (b64) => Uint8Array.from(Buffer.from(b64, "base64"));
 const i16ToB64 = (i16) => Buffer.from(new Int16Array(i16).buffer).toString("base64");
 
@@ -81,60 +85,59 @@ wss.on("connection", (twilioWS) => {
   console.log("🔌 Twilio stream connected");
   twilioWS.binaryType = "arraybuffer";
 
-  let streamSid = null;        // Twilio requires this on outbound media
-  let aiSpeaking = false;      // basic turn-taking
+  let streamSid = null;            // MUST be included on outbound media
+  let aiSpeaking = false;
   let requestedThisTurn = false;
+  let debounceTimer = null;
 
-  const openaiWS = connectOpenAI();
-  openaiWS.binaryType = "arraybuffer";
+  const openaiWS = ECHO_TEST ? null : connectOpenAI();
+  if (openaiWS) openaiWS.binaryType = "arraybuffer";
 
-  openaiWS.on("open", () => {
-    console.log("🟢 OpenAI Realtime connected");
-    const sessionUpdate = {
-      type: "session.update",
-      session: {
-        output_audio_format: "pcm_s16le_24000", // high quality; we'll downsample to 8k µ-law
-        instructions:
-          "You are a warm, concise receptionist for a pediatric dental and orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences. Pause when the caller speaks."
+  if (openaiWS) {
+    openaiWS.on("open", () => {
+      console.log("🟢 OpenAI Realtime connected");
+      const sessionUpdate = {
+        type: "session.update",
+        session: {
+          output_audio_format: "pcm_s16le_24000",
+          instructions:
+            "You are a warm, concise receptionist for a pediatric dental & orthodontics office. Keep answers under two sentences and pause when the caller speaks."
+        }
+      };
+      openaiWS.send(JSON.stringify(sessionUpdate));
+    });
+
+    openaiWS.on("message", (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      const t = msg?.type;
+
+      if (t === "response.audio.delta" && msg.delta) {
+        // AI speaking chunk: base64 PCM16 @ 24k -> 8k µ-law -> send to Twilio
+        const pcm24k = new Int16Array(Buffer.from(msg.delta, "base64").buffer);
+        const pcm8k = resampleLinear(pcm24k, 24000, 8000);
+        const ulaw = muLawEncode(pcm8k);
+        if (streamSid) {
+          twilioWS.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: Buffer.from(ulaw).toString("base64") }
+          }));
+          twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ai_chunk" } }));
+        }
+        aiSpeaking = true;
+      } else if (t === "response.completed") {
+        aiSpeaking = false;
+        requestedThisTurn = false;
+        if (streamSid) twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ai_done" } }));
       }
-    };
-    openaiWS.send(JSON.stringify(sessionUpdate));
-  });
+    });
 
-  // Handle OpenAI JSON events (audio deltas, completed)
-  openaiWS.on("message", (data) => {
-    // OpenAI messages are JSON (sometimes include base64 audio delta)
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
-    const t = msg?.type;
+    openaiWS.on("close", () => console.log("🔴 OpenAI Realtime closed"));
+    openaiWS.on("error", (e) => console.log("⚠️ OpenAI error", e?.message || e));
+  }
 
-    if (t === "response.audio.delta" && msg.delta) {
-      // AI speaking chunk: base64 PCM16 @ 24k
-      const pcm24k = new Int16Array(Buffer.from(msg.delta, "base64").buffer);
-      const pcm8k = resampleLinear(pcm24k, 24000, 8000);
-      const ulaw = muLawEncode(pcm8k);
-      if (streamSid) {
-        twilioWS.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: Buffer.from(ulaw).toString("base64") }
-        }));
-        twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ai_chunk" } }));
-      }
-      aiSpeaking = true;
-    } else if (t === "response.completed") {
-      aiSpeaking = false;
-      requestedThisTurn = false;
-      if (streamSid) {
-        twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "ai_done" } }));
-      }
-    }
-  });
-
-  openaiWS.on("close", () => console.log("🔴 OpenAI Realtime closed"));
-  openaiWS.on("error", (e) => console.log("⚠️ OpenAI error", e?.message || e));
-
-  // From Twilio → OpenAI
+  // From Twilio → either echo back, or send to OpenAI
   twilioWS.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -146,41 +149,55 @@ wss.on("connection", (twilioWS) => {
     }
 
     if (msg.event === "media") {
-      // Incoming µ-law/8k → PCM16/8k → upsample to 16k → feed buffer
+      // Incoming µ-law/8k audio
       const ulaw = b64ToU8(msg.media.payload);
       const pcm8k = muLawDecode(ulaw);
+
+      if (ECHO_TEST) {
+        // Loop it back immediately so you hear your voice (confirm outbound works)
+        if (streamSid) {
+          twilioWS.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: Buffer.from(ulaw).toString("base64") }
+          }));
+        }
+        return;
+      }
+
+      // Otherwise, send to OpenAI
+      if (!openaiWS || openaiWS.readyState !== 1) return;
       const pcm16k = resampleLinear(pcm8k, 8000, 16000);
       const b64 = i16ToB64(pcm16k);
       openaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
 
-      // Ask for a response (once per turn)
-      if (!aiSpeaking && !requestedThisTurn) {
-        openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
-        requestedThisTurn = true;
-      }
-      return;
-    }
-
-    if (msg.event === "mark") {
-      // marks we send come back from Twilio when played — optional to log
-      // console.log("mark played", msg?.mark?.name);
+      // Debounce: commit buffer after a short pause, then request a response
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (openaiWS.readyState !== 1) return;
+        openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" })); // ✅ required
+        if (!aiSpeaking && !requestedThisTurn) {
+          openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
+          requestedThisTurn = true;
+        }
+      }, 200); // wait 200ms of silence before committing
       return;
     }
 
     if (msg.event === "stop") {
       console.log("⏹️ stream stop");
-      try { openaiWS.close(); } catch {}
+      try { if (openaiWS) openaiWS.close(); } catch {}
       return;
     }
   });
 
   twilioWS.on("close", () => {
     console.log("🔌 Twilio stream closed");
-    try { openaiWS.close(); } catch {}
+    try { if (openaiWS) openaiWS.close(); } catch {}
   });
   twilioWS.on("error", () => {
     console.log("⚠️ Twilio stream error");
-    try { openaiWS.close(); } catch {}
+    try { if (openaiWS) openaiWS.close(); } catch {}
   });
 });
 
