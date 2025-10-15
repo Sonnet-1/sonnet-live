@@ -96,32 +96,30 @@ wss.on("connection", (twilioWS) => {
 
   if (openaiWS) {
     openaiWS.on("open", () => {
-      console.log("🟢 OpenAI Realtime connected");
+  console.log("🟢 OpenAI Realtime connected");
 
-      // Correct session payload (no voice)
-      const sessionUpdate = {
-        type: "session.update",
-        session: {
-          type: "realtime",
-          model: "gpt-4o-realtime-preview",
-          input_audio_format: "pcm_s16le_16000",
-          output_audio_format: "pcm_s16le_24000",
-          instructions:
-            "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
-        }
-      };
-      openaiWS.send(JSON.stringify(sessionUpdate));
+  // Correct session payload — only valid fields
+  const sessionUpdate = {
+    type: "session.update",
+    session: {
+      type: "realtime",
+      model: "gpt-4o-realtime-preview",
+      output_audio_format: "pcm_s16le_24000",
+      instructions:
+        "You are a warm, concise receptionist for a pediatric dental & orthodontics office in Ponte Vedra, Florida. Keep answers under two sentences and pause when the caller speaks."
+    }
+  };
+  openaiWS.send(JSON.stringify(sessionUpdate));
 
-      // Greeting — specify voice here
-      openaiWS.send(JSON.stringify({
-        type: "response.create",
-        response: {
-          instructions: "Hello, thanks for calling. How can I help today?",
-          modalities: ["audio"],
-          speech: { voice: "alloy" }
-        }
-      }));
-    });
+  // Greeting with correct voice settings
+  openaiWS.send(JSON.stringify({
+    type: "response.create",
+    response: {
+      instructions: "Hello, thanks for calling. How can I help today?",
+      speech: { voice: "alloy" } // voice must be inside 'speech'
+    }
+  }));
+});
 
     openaiWS.on("message", (data) => {
       try {
