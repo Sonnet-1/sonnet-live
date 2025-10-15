@@ -186,10 +186,23 @@ openaiWS.send(JSON.stringify({
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid || msg.streamSid || null;
-      console.log("▶️ stream start", streamSid, msg.start?.callSid);
-      return;
+  if (msg.event === "start") {
+  streamSid = msg.start?.streamSid || msg.streamSid || null;
+  console.log("▶️ stream start", streamSid, msg.start?.callSid);
+
+  // start heartbeat only after streamSid exists
+  const ping = setInterval(() => {
+    if (twilioWS.readyState === 1 && streamSid) {
+      safeSend(twilioWS, { event: "mark", streamSid, mark: { name: "ping" } });
+    }
+  }, 5000);
+
+  twilioWS.on("close", () => clearInterval(ping));
+  twilioWS.on("error", () => clearInterval(ping));
+
+  return;
+}
+
     }
 
     if (msg.event === "media") {
@@ -200,7 +213,7 @@ openaiWS.send(JSON.stringify({
       if (ECHO_TEST) {
         // Loop it back immediately so you hear your voice (confirm outbound works)
         if (streamSid) {
-          twilioWS.send(JSON.stringify({
+          safeSend(twilioWS,{
             event: "media",
             streamSid,
             media: { payload: Buffer.from(ulaw).toString("base64") }
