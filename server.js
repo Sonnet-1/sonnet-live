@@ -101,11 +101,11 @@ wss.on("connection", (twilioWS) => {
    openaiWS.on("open", () => {
   console.log("🟢 OpenAI Realtime connected");
 
-  // Required session shape
+  // Correct session payload
   const sessionUpdate = {
     type: "session.update",
     session: {
-      type: "realtime.session",
+      type: "realtime",                    // <-- fixed
       model: "gpt-4o-realtime-preview",
       voice: "alloy",
       input_audio_format: "pcm_s16le_16000",
@@ -116,12 +116,11 @@ wss.on("connection", (twilioWS) => {
   };
   openaiWS.send(JSON.stringify(sessionUpdate));
 
-  // Simple greeting so we can confirm audio out works
+  // Simple greeting — rely on session audio settings (no extra fields)
   openaiWS.send(JSON.stringify({
     type: "response.create",
     response: {
-      instructions: "Hello, thanks for calling. How can I help today?",
-      audio_format: "pcm_s16le_24000"
+      instructions: "Hello, thanks for calling. How can I help today?"
     }
   }));
 });
